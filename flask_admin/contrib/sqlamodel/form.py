@@ -1,5 +1,8 @@
+import itertools
+
 from wtforms import fields, validators
 from sqlalchemy import Boolean, Column
+from sqlalchemy.ext.associationproxy import AssociationProxy
 
 from flask.ext.admin import form
 from flask.ext.admin.form import Select2Field
@@ -59,7 +62,7 @@ class AdminModelConverter(ModelConverterBase):
 
         return None
 
-    def convert(self, model, mapper, prop, field_args, hidden_pk):
+    def convert(self, model, mapper, prop, field_args, hidden_pk, name):
         kwargs = {
             'validators': [],
             'filters': []
@@ -69,12 +72,32 @@ class AdminModelConverter(ModelConverterBase):
             kwargs.update(field_args)
 
         # Check if it is relation or property
-        if hasattr(prop, 'direction'):
+        if hasattr(prop, 'direction') or hasattr(prop, 'scalar'):
+            if hasattr(prop, 'scalar'):
+                # property is an assoc proxy
+                proxy = prop
+                prop = proxy.target_class._sa_class_manager.mapper.get_property(
+                    proxy.value_attr)
+
+                direction = prop.direction.name
+
+                if not proxy.scalar:
+                    if direction in ('ONETOMANY', 'MANYTOONE'):
+                        direction = 'MANYTOMANY'
+                    elif direction == 'ONETOONE':
+                        direction = 'MANYTOONE'
+                    else:
+                        direction = 'MANYTOMANYTOMANY'  # we can't handle this,
+                                                        # but maybe overridden
+                                                        # widget can
+            else:
+                direction = prop.direction.name
+
             remote_model = prop.mapper.class_
             local_column = prop.local_remote_pairs[0][0]
 
-            kwargs['label'] = self._get_label(prop.key, kwargs)
-            kwargs['description'] = self._get_description(prop.key, kwargs)
+            kwargs['label'] = self._get_label(name, kwargs)
+            kwargs['description'] = self._get_description(name, kwargs)
 
             if local_column.nullable:
                 kwargs['validators'].append(validators.Optional())
@@ -82,7 +105,7 @@ class AdminModelConverter(ModelConverterBase):
                 kwargs['validators'].append(validators.InputRequired())
 
             # Override field type if necessary
-            override = self._get_field_override(prop.key)
+            override = self._get_field_override(name)
             if override:
                 return override(**kwargs)
 
@@ -92,10 +115,10 @@ class AdminModelConverter(ModelConverterBase):
             if 'query_factory' not in kwargs:
                 kwargs['query_factory'] = lambda: self.session.query(remote_model)
 
-            if prop.direction.name == 'MANYTOONE':
+            if direction == 'MANYTOONE':
                 return QuerySelectField(widget=form.Select2Widget(),
                                         **kwargs)
-            elif prop.direction.name == 'ONETOMANY':
+            elif direction == 'ONETOMANY':
                 # Skip backrefs
                 if not local_column.foreign_keys and getattr(self.view, 'column_hide_backrefs', False):
                     return None
@@ -103,10 +126,12 @@ class AdminModelConverter(ModelConverterBase):
                 return QuerySelectMultipleField(
                                 widget=form.Select2Widget(multiple=True),
                                 **kwargs)
-            elif prop.direction.name == 'MANYTOMANY':
+            elif direction == 'MANYTOMANY':
                 return QuerySelectMultipleField(
                                 widget=form.Select2Widget(multiple=True),
                                 **kwargs)
+            else:
+                raise Exception('Unsupported relationship direction %s' % direction)
         else:
             # Ignore pk/fk
             if hasattr(prop, 'columns'):
@@ -339,6 +364,14 @@ def get_form(model, converter,
 
     properties = ((p.key, p) for p in mapper.iterate_properties)
 
+    def assoc_proxies():
+        for p in dir(model):
+            if isinstance(getattr(model, p), AssociationProxy):
+                proxy = getattr(model, p)
+                yield p, proxy
+
+    properties = itertools.chain(properties, assoc_proxies())
+
     if only:
         props = dict(properties)
 
@@ -353,6 +386,10 @@ def get_form(model, converter,
             p = getattr(model, name, None)
             if p is not None and hasattr(p, 'property'):
                 return p.property
+            elif p is not None and isinstance(p, AssociationProxy):
+                return p
+                #return p.target_class._sa_class_manager.mapper.get_property(
+                    #p.value_attr)
 
             raise ValueError('Invalid model property name %s.%s' % (model, name))
 
@@ -369,7 +406,7 @@ def get_form(model, converter,
 
         prop = _resolve_prop(p)
 
-        field = converter.convert(model, mapper, prop, field_args.get(name), hidden_pk)
+        field = converter.convert(model, mapper, prop, field_args.get(name), hidden_pk, name)
         if field is not None:
             field_dict[name] = field
 
